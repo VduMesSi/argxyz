@@ -1,0 +1,149 @@
+#!/bin/bash
+set -e
+umask 077
+
+[ "$#" -eq 4 ] || exit 1
+
+UUID="$1"
+PORT="$2"
+ARGO_DOMAIN="$3"
+ARGO_AUTH="$4"
+BASE="${HOME}/vless-argo"
+
+[ "$(id -u)" -eq 0 ] || exit 1
+[ -n "$UUID" ] && [ -n "$PORT" ] && [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ] || exit 1
+
+case "$PORT" in
+  ''|*[!0-9]*) exit 1 ;;
+esac
+
+case "$(uname -m)" in
+  x86_64|amd64) CPU=amd64; XRAY_ARCH="64" ;;
+  aarch64|arm64) CPU=arm64; XRAY_ARCH="arm64-v8a" ;;
+  *) exit 1 ;;
+esac
+
+command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || exit 1
+command -v unzip >/dev/null 2>&1 || exit 1
+mkdir -p "$BASE"
+chmod 700 "$BASE"
+
+if [ ! -x "$BASE/xray" ]; then
+  URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"
+  TMP_ZIP="$(mktemp)"
+  curl -fsSL --retry 3 -o "$TMP_ZIP" "$URL" 2>/dev/null || wget -qO "$TMP_ZIP" "$URL"
+  unzip -o -q "$TMP_ZIP" xray -d "$BASE"
+  rm -f "$TMP_ZIP"
+  chmod 700 "$BASE/xray"
+fi
+
+if [ ! -x "$BASE/cloudflared" ]; then
+  URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CPU}"
+  curl -fsSL --retry 3 -o "$BASE/cloudflared" "$URL" 2>/dev/null || wget -qO "$BASE/cloudflared" "$URL"
+  chmod 700 "$BASE/cloudflared"
+fi
+
+# ---------- 随机参数 ----------
+rand_str() {
+  tr -dc "$1" </dev/urandom | head -c "$2"
+}
+
+RAND_PATH="$(rand_str 'a-z0-9' 12)"
+WS_PATH="/${RAND_PATH}"
+PAD_HEADER="$(rand_str 'a-z' 1)$(rand_str 'a-z0-9' 7)"
+PAD_KEY="$(rand_str 'A-Za-z0-9' 8)"
+
+cat > "$BASE/xray.json" <<JSON
+{
+  "log": {
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {
+          "path": "${WS_PATH}",
+          "mode": "auto",
+          "xPaddingObfsMode": true,
+          "xPaddingMethod": "tokenish",
+          "xPaddingPlacement": "queryInHeader",
+          "xPaddingHeader": "${PAD_HEADER}",
+          "xPaddingKey": "${PAD_KEY}"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom"
+    }
+  ]
+}
+JSON
+chmod 600 "$BASE/xray.json"
+
+printf 'TUNNEL_TOKEN=%s\n' "$ARGO_AUTH" > "$BASE/cloudflared.env"
+chmod 600 "$BASE/cloudflared.env"
+
+if command -v systemctl >/dev/null 2>&1 && [ "$(ps -p 1 -o comm= 2>/dev/null)" = systemd ]; then
+  cat > /etc/systemd/system/vless-argo-xray.service <<UNIT
+[Unit]
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${BASE}/xray run -c ${BASE}/xray.json
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  cat > /etc/systemd/system/vless-argo.service <<UNIT
+[Unit]
+After=network.target vless-argo-xray.service
+Requires=vless-argo-xray.service
+
+[Service]
+Type=simple
+EnvironmentFile=${BASE}/cloudflared.env
+ExecStart=${BASE}/cloudflared tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chmod 644 /etc/systemd/system/vless-argo-xray.service /etc/systemd/system/vless-argo.service
+
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable vless-argo-xray.service vless-argo.service >/dev/null 2>&1
+  systemctl restart vless-argo-xray.service >/dev/null 2>&1
+  systemctl restart vless-argo.service >/dev/null 2>&1
+else
+  pkill -f "${BASE}/xray run -c ${BASE}/xray.json" 2>/dev/null || true
+  pkill -f "${BASE}/cloudflared tunnel" 2>/dev/null || true
+  nohup "$BASE/xray" run -c "$BASE/xray.json" >/dev/null 2>&1 &
+  TUNNEL_TOKEN="$ARGO_AUTH" nohup "$BASE/cloudflared" tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run >/dev/null 2>&1 &
+fi
+
+EXTRA="%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22${PAD_HEADER}%22%2C%22xPaddingKey%22%3A%22${PAD_KEY}%22%7D"
+
+printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&type=xhttp&host=%s&path=/%s&mode=auto&extra=%s#vless-xhttp-tls-argo\n' \
+  "$UUID" "$ARGO_DOMAIN" "$ARGO_DOMAIN" "$ARGO_DOMAIN" "$RAND_PATH" "$EXTRA"
+
+printf '\npath: %s\nxPaddingHeader: %s\nxPaddingKey: %s\n' "$WS_PATH" "$PAD_HEADER" "$PAD_KEY"
