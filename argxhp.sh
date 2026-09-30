@@ -21,19 +21,16 @@ case "$PORT" in
   ''|*[!0-9]*) exit 1 ;;
 esac
 
-# path：允许带或不带开头的 /，只允许字母数字 _ -
 RAND_PATH="${IN_PATH#/}"
 case "$RAND_PATH" in
   ''|*[!A-Za-z0-9_-]*) exit 1 ;;
 esac
 WS_PATH="/${RAND_PATH}"
 
-# xPaddingHeader：HTTP 头名，只允许字母数字 -
 case "$PAD_HEADER" in
   *[!A-Za-z0-9-]*) exit 1 ;;
 esac
 
-# xPaddingKey：query 的 key，只允许字母数字 _
 case "$PAD_KEY" in
   *[!A-Za-z0-9_]*) exit 1 ;;
 esac
@@ -106,7 +103,6 @@ cat > "$BASE/xray.json" <<JSON
 JSON
 chmod 600 "$BASE/xray.json"
 
-# token 通过环境变量传递，不出现在 unit 文件和进程参数中
 printf 'TUNNEL_TOKEN=%s\n' "$ARGO_AUTH" > "$BASE/cloudflared.env"
 chmod 600 "$BASE/cloudflared.env"
 
@@ -157,5 +153,3 @@ EXTRA="%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%
 
 printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&type=xhttp&host=%s&path=/%s&mode=packet-up&extra=%s#vless-xhttp-tls-argo\n' \
   "$UUID" "$ARGO_DOMAIN" "$ARGO_DOMAIN" "$ARGO_DOMAIN" "$RAND_PATH" "$EXTRA"
-
-printf '\npath: %s\nxPaddingHeader: %s\nxPaddingKey: %s\n' "$WS_PATH" "$PAD_HEADER" "$PAD_KEY"
