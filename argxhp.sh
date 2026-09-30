@@ -75,7 +75,7 @@ cat > "$BASE/xray.json" <<JSON
         "security": "none",
         "xhttpSettings": {
           "path": "${WS_PATH}",
-          "mode": "auto",
+          "mode": "packet-up",
           "xPaddingObfsMode": true,
           "xPaddingMethod": "tokenish",
           "xPaddingPlacement": "queryInHeader",
