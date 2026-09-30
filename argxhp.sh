@@ -2,19 +2,40 @@
 set -e
 umask 077
 
-[ "$#" -eq 4 ] || exit 1
+[ "$#" -eq 7 ] || exit 1
 
 UUID="$1"
 PORT="$2"
 ARGO_DOMAIN="$3"
 ARGO_AUTH="$4"
+IN_PATH="$5"
+PAD_HEADER="$6"
+PAD_KEY="$7"
 BASE="${HOME}/vless-argo"
 
 [ "$(id -u)" -eq 0 ] || exit 1
-[ -n "$UUID" ] && [ -n "$PORT" ] && [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ] || exit 1
+[ -n "$UUID" ] && [ -n "$PORT" ] && [ -n "$ARGO_DOMAIN" ] && [ -n "$ARGO_AUTH" ] \
+  && [ -n "$IN_PATH" ] && [ -n "$PAD_HEADER" ] && [ -n "$PAD_KEY" ] || exit 1
 
 case "$PORT" in
   ''|*[!0-9]*) exit 1 ;;
+esac
+
+# path：允许带或不带开头的 /，只允许字母数字 _ -
+RAND_PATH="${IN_PATH#/}"
+case "$RAND_PATH" in
+  ''|*[!A-Za-z0-9_-]*) exit 1 ;;
+esac
+WS_PATH="/${RAND_PATH}"
+
+# xPaddingHeader：HTTP 头名，只允许字母数字 -
+case "$PAD_HEADER" in
+  *[!A-Za-z0-9-]*) exit 1 ;;
+esac
+
+# xPaddingKey：query 的 key，只允许字母数字 _
+case "$PAD_KEY" in
+  *[!A-Za-z0-9_]*) exit 1 ;;
 esac
 
 case "$(uname -m)" in
@@ -42,15 +63,6 @@ if [ ! -x "$BASE/cloudflared" ]; then
   curl -fsSL --retry 3 -o "$BASE/cloudflared" "$URL" 2>/dev/null || wget -qO "$BASE/cloudflared" "$URL"
   chmod 700 "$BASE/cloudflared"
 fi
-
-rand_str() {
-  tr -dc "$1" </dev/urandom | head -c "$2"
-}
-
-RAND_PATH="$(rand_str 'a-z0-9' 12)"
-WS_PATH="/${RAND_PATH}"
-PAD_HEADER="$(rand_str 'a-z' 1)$(rand_str 'a-z0-9' 7)"
-PAD_KEY="$(rand_str 'A-Za-z0-9' 8)"
 
 cat > "$BASE/xray.json" <<JSON
 {
@@ -94,6 +106,7 @@ cat > "$BASE/xray.json" <<JSON
 JSON
 chmod 600 "$BASE/xray.json"
 
+# token 通过环境变量传递，不出现在 unit 文件和进程参数中
 printf 'TUNNEL_TOKEN=%s\n' "$ARGO_AUTH" > "$BASE/cloudflared.env"
 chmod 600 "$BASE/cloudflared.env"
 
@@ -142,7 +155,7 @@ fi
 
 EXTRA="%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22${PAD_HEADER}%22%2C%22xPaddingKey%22%3A%22${PAD_KEY}%22%7D"
 
-printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&type=xhttp&host=%s&path=/%s&mode=auto&extra=%s#vless-xhttp-tls-argo\n' \
+printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&type=xhttp&host=%s&path=/%s&mode=packet-up&extra=%s#vless-xhttp-tls-argo\n' \
   "$UUID" "$ARGO_DOMAIN" "$ARGO_DOMAIN" "$ARGO_DOMAIN" "$RAND_PATH" "$EXTRA"
 
 printf '\npath: %s\nxPaddingHeader: %s\nxPaddingKey: %s\n' "$WS_PATH" "$PAD_HEADER" "$PAD_KEY"
