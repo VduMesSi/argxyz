@@ -58,7 +58,7 @@ if [ ! -x "$BASE/cloudflared" ]; then
   chmod 700 "$BASE/cloudflared"
 fi
 
-# ---------- xray.json：3 个 WS inbound ----------
+# ---------- xray.json：3 个 xhttp inbound（精简配置）----------
 INBOUNDS=""
 for ((k=0; k<N; k++)); do
   [ -z "$INBOUNDS" ] || INBOUNDS="${INBOUNDS},"
@@ -73,10 +73,11 @@ for ((k=0; k<N; k++)); do
         \"decryption\": \"none\"
       },
       \"streamSettings\": {
-        \"network\": \"ws\",
+        \"network\": \"xhttp\",
         \"security\": \"none\",
-        \"wsSettings\": {
-          \"path\": \"/${RAND_PATH}\"
+        \"xhttpSettings\": {
+          \"path\": \"/${RAND_PATH}\",
+          \"mode\": \"packet-up\"
         }
       }
     }"
@@ -84,7 +85,7 @@ done
 
 cat > "$BASE/xray.json" <<JSON
 {
-  "log": { "loglevel": "none" },
+  "log": { "loglevel": "warning" },
   "inbounds": [${INBOUNDS}
   ],
   "outbounds": [
@@ -151,12 +152,10 @@ else
   TUNNEL_TOKEN="$ARGO_AUTH" nohup "$BASE/cloudflared" tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run >/dev/null 2>&1 &
 fi
 
-ENC_PATH="%2F${RAND_PATH}%3Fed%3D2048"
-
 for ((k=0; k<N; k++)); do
   printf '\n# route %s  domain=%s  port=%s\n' "$((k+1))" "${T_DOMAIN[$k]}" "${T_PORT[$k]}"
-  printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=http%%2F1.1&type=ws&host=%s&path=%s#vless-ws-argo-%s\n' \
-    "$UUID" "${T_DOMAIN[$k]}" "${T_DOMAIN[$k]}" "${T_DOMAIN[$k]}" "$ENC_PATH" "$((k+1))"
+  printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&type=xhttp&host=%s&path=%%2F%s&mode=packet-up#vless-xhttp-argo-%s\n' \
+    "$UUID" "${T_DOMAIN[$k]}" "${T_DOMAIN[$k]}" "${T_DOMAIN[$k]}" "$RAND_PATH" "$((k+1))"
 done
 
-printf '\npath: /%s?ed=2048\n' "$RAND_PATH"
+printf '\npath: /%s\nmode: packet-up\n' "$RAND_PATH"
