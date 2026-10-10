@@ -58,7 +58,6 @@ if [ ! -x "$BASE/cloudflared" ]; then
   chmod 700 "$BASE/cloudflared"
 fi
 
-# ---------- xray.json：3 个 xhttp inbound（精简配置）----------
 INBOUNDS=""
 for ((k=0; k<N; k++)); do
   [ -z "$INBOUNDS" ] || INBOUNDS="${INBOUNDS},"
