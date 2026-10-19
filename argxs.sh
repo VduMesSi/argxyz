@@ -141,22 +141,8 @@ for ((i=0; i<N; i++)); do
   PATH_ARR[$i]="$PATH"
 done
 
-# ---------- Detect CPU architecture ----------
-
-case "$(uname -m)" in
-  x86_64|amd64)
-    CPU="amd64"
-    XRAY_ARCH="64"
-    ;;
-  aarch64|arm64)
-    CPU="arm64"
-    XRAY_ARCH="arm64-v8a"
-    ;;
-  *)
-    echo "Unsupported CPU architecture: $(uname -m)" >&2
-    exit 1
-    ;;
-esac
+CPU="arm64"
+XRAY_ARCH="arm64-v8a"
 
 command -v curl >/dev/null 2>&1 || {
   echo "curl is required." >&2
