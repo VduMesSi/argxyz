@@ -3,332 +3,383 @@
 set -Eeuo pipefail
 umask 077
 
+# ============================================================
+# VLESS + XHTTP packet-up + Cloudflare Tunnel Token
+#
 # Usage:
-# sudo bash vless-argo-multi.sh \
-#   UUID \
-#   "10001,10002,10003" \
-#   "a.example.com,b.example.net,c.example.org" \
-#   TUNNEL_TOKEN \
-#   "pathA,pathB,pathC" \
-#   PAD_HEADER \
-#   PAD_KEY
+# bash install-multi-domain.sh \
+#   UUID PORTS DOMAINS TUNNEL_TOKEN PATHS PAD_HEADER PAD_KEY
+#
+# Example:
+# bash install-multi-domain.sh \
+#   7f3c2b1a-6d84-4e92-a531-9c7f28b6d415 \
+#   10001,10002 \
+#   a.example.com,b.example.net \
+#   'YOUR_CLOUDFLARE_TUNNEL_TOKEN' \
+#   /alpha-path,/beta-path \
+#   X-Padding csrf_token
+#
+# PORTS, DOMAINS and PATHS must have the same number of items.
+# ============================================================
 
-[ "$#" -eq 7 ] || {
-  echo "Usage: $0 UUID PORTS DOMAINS TOKEN PATHS PAD_HEADER PAD_KEY" >&2
-  exit 1
-}
+# ---------- CPU architecture ----------
+# Default: x86_64 / amd64 VPS.
+# For ARM64 VPS, change these to:
+# CPU="arm64"
+# XRAY_ARCH="arm64-v8a"
+
+CPU="amd64"
+XRAY_ARCH="64"
+
+# ---------- Installation directory ----------
+BASE="/opt/vless-argo"
+XRAY_BIN="${BASE}/xray"
+XRAY_CONFIG="${BASE}/config.json"
+CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
+TOKEN_FILE="${BASE}/cloudflared.env"
+
+XRAY_SERVICE="vless-argo-xray"
+CF_SERVICE="vless-argo"
+
+# ---------- Basic checks ----------
+if [[ "${EUID}" -ne 0 ]]; then
+    echo "ERROR: Run this script as root." >&2
+    exit 1
+fi
+
+if [[ "$#" -ne 7 ]]; then
+    echo "Usage:"
+    echo "bash $0 UUID PORTS DOMAINS TUNNEL_TOKEN PATHS PAD_HEADER PAD_KEY"
+    exit 1
+fi
 
 UUID="$1"
-PORTS="$2"
-DOMAINS="$3"
-ARGO_AUTH="$4"
-PATHS="$5"
+PORTS_RAW="$2"
+DOMAINS_RAW="$3"
+TUNNEL_TOKEN="$4"
+PATHS_RAW="$5"
 PAD_HEADER="$6"
 PAD_KEY="$7"
 
-BASE="${HOME}/vless-argo"
+if [[ ! "$UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "ERROR: Invalid UUID." >&2
+    exit 1
+fi
 
-[ "$(id -u)" -eq 0 ] || {
-  echo "Please run as root." >&2
-  exit 1
-}
+if [[ -z "$TUNNEL_TOKEN" || "$TUNNEL_TOKEN" == *$'\n'* ]]; then
+    echo "ERROR: Invalid Cloudflare Tunnel Token." >&2
+    exit 1
+fi
 
-# ---------- Validate basic inputs ----------
+# Restrict values inserted into JSON to simple safe characters.
+if [[ ! "$PAD_HEADER" =~ ^[A-Za-z0-9-]+$ ]]; then
+    echo "ERROR: PAD_HEADER may contain only letters, numbers and hyphens." >&2
+    exit 1
+fi
 
-[[ "$UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
-  echo "Invalid UUID." >&2
-  exit 1
-}
+if [[ ! "$PAD_KEY" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "ERROR: PAD_KEY may contain only letters, numbers, underscores and hyphens." >&2
+    exit 1
+fi
 
-[[ -n "$ARGO_AUTH" && "$ARGO_AUTH" != *$'\n'* && "$ARGO_AUTH" != *$'\r'* ]] || {
-  echo "Invalid Tunnel token." >&2
-  exit 1
-}
+IFS=',' read -r -a PORTS <<< "$PORTS_RAW"
+IFS=',' read -r -a DOMAINS <<< "$DOMAINS_RAW"
+IFS=',' read -r -a PATHS <<< "$PATHS_RAW"
 
-[[ "$PAD_HEADER" =~ ^[A-Za-z0-9-]+$ ]] || {
-  echo "Invalid padding header." >&2
-  exit 1
-}
+COUNT="${#PORTS[@]}"
 
-[[ "$PAD_KEY" =~ ^[A-Za-z0-9_]+$ ]] || {
-  echo "Invalid padding key." >&2
-  exit 1
-}
+if [[ "$COUNT" -lt 1 ||
+      "${#DOMAINS[@]}" -ne "$COUNT" ||
+      "${#PATHS[@]}" -ne "$COUNT" ]]; then
+    echo "ERROR: PORTS, DOMAINS and PATHS must contain the same number of items." >&2
+    exit 1
+fi
 
-[[ -n "$PORTS" && -n "$DOMAINS" && -n "$PATHS" ]] || exit 1
-
-IFS=',' read -r -a PORT_ARR <<< "$PORTS"
-IFS=',' read -r -a DOMAIN_ARR <<< "$DOMAINS"
-IFS=',' read -r -a PATH_ARR <<< "$PATHS"
-
-N="${#PORT_ARR[@]}"
-
-[ "$N" -ge 2 ] &&
-[ "${#DOMAIN_ARR[@]}" -eq "$N" ] &&
-[ "${#PATH_ARR[@]}" -eq "$N" ] || {
-  echo "Ports, domains and paths must have the same count (at least 2)." >&2
-  exit 1
-}
-
-# Validate ports, hostnames and paths.
 declare -A SEEN_PORTS=()
 declare -A SEEN_DOMAINS=()
-declare -A SEEN_PATHS=()
 
-for ((i=0; i<N; i++)); do
-  PORT="${PORT_ARR[$i]}"
-  DOMAIN="${DOMAIN_ARR[$i],,}"
-  PATH="${PATH_ARR[$i]#/}"
+for i in "${!PORTS[@]}"; do
+    port="${PORTS[$i]}"
+    domain="${DOMAINS[$i]}"
+    path="${PATHS[$i]}"
 
-  [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || {
-    echo "Invalid port: $PORT" >&2
-    exit 1
-  }
+    if [[ ! "$port" =~ ^[0-9]+$ ]] ||
+       (( port < 1 || port > 65535 )); then
+        echo "ERROR: Invalid port: $port" >&2
+        exit 1
+    fi
 
-  (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || {
-    echo "Port out of range: $PORT" >&2
-    exit 1
-  }
+    if [[ -n "${SEEN_PORTS[$port]+x}" ]]; then
+        echo "ERROR: Duplicate port: $port" >&2
+        exit 1
+    fi
+    SEEN_PORTS["$port"]=1
 
-  PORT="$((10#$PORT))"
+    domain="${domain,,}"
+    DOMAINS[$i]="$domain"
 
-  # Validate DNS labels, including different root domains.
-  [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || {
-    echo "Invalid hostname: $DOMAIN" >&2
-    exit 1
-  }
+    if [[ ! "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] ||
+       [[ "$domain" == *..* ]]; then
+        echo "ERROR: Invalid domain: $domain" >&2
+        exit 1
+    fi
 
-  [[ ${#DOMAIN} -le 253 && "$DOMAIN" == *.* ]] || {
-    echo "Invalid hostname: $DOMAIN" >&2
-    exit 1
-  }
+    if [[ -n "${SEEN_DOMAINS[$domain]+x}" ]]; then
+        echo "ERROR: Duplicate domain: $domain" >&2
+        exit 1
+    fi
+    SEEN_DOMAINS["$domain"]=1
 
-  IFS='.' read -r -a LABELS <<< "$DOMAIN"
-  for LABEL in "${LABELS[@]}"; do
-    [[ "$LABEL" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] &&
-    [ "${#LABEL}" -le 63 ] || {
-      echo "Invalid DNS label in hostname: $DOMAIN" >&2
-      exit 1
-    }
-  done
-
-  [[ "$PATH" =~ ^[A-Za-z0-9_-]+$ ]] || {
-    echo "Invalid XHTTP path: $PATH" >&2
-    exit 1
-  }
-
-  [[ -z "${SEEN_PORTS[$PORT]+x}" ]] || {
-    echo "Duplicate port: $PORT" >&2
-    exit 1
-  }
-
-  [[ -z "${SEEN_DOMAINS[$DOMAIN]+x}" ]] || {
-    echo "Duplicate hostname: $DOMAIN" >&2
-    exit 1
-  }
-
-  [[ -z "${SEEN_PATHS[$PATH]+x}" ]] || {
-    echo "Duplicate path: $PATH" >&2
-    exit 1
-  }
-
-  SEEN_PORTS[$PORT]=1
-  SEEN_DOMAINS[$DOMAIN]=1
-  SEEN_PATHS[$PATH]=1
-
-  PORT_ARR[$i]="$PORT"
-  DOMAIN_ARR[$i]="$DOMAIN"
-  PATH_ARR[$i]="$PATH"
+    if [[ ! "$path" =~ ^/[A-Za-z0-9/_-]+$ ]]; then
+        echo "ERROR: Invalid XHTTP path: $path" >&2
+        echo "Use a path beginning with / and containing letters, numbers, /, _ or -." >&2
+        exit 1
+    fi
 done
 
-CPU="arm64"
-XRAY_ARCH="arm64-v8a"
+# ---------- Download helper ----------
+# curl is preferred; wget is supported as a fallback.
+if ! command -v curl >/dev/null 2>&1 &&
+   ! command -v wget >/dev/null 2>&1; then
+    echo "ERROR: curl or wget is required." >&2
+    echo "Debian/Ubuntu: apt-get update && apt-get install -y curl unzip" >&2
+    exit 1
+fi
 
-command -v curl >/dev/null 2>&1 || {
-  echo "curl is required." >&2
-  exit 1
+if ! command -v unzip >/dev/null 2>&1; then
+    echo "ERROR: unzip is required." >&2
+    echo "Debian/Ubuntu: apt-get update && apt-get install -y unzip" >&2
+    exit 1
+fi
+
+download_file() {
+    local url="$1"
+    local output="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fLsS --retry 3 --connect-timeout 15 \
+            "$url" -o "$output"
+    else
+        wget -q --tries=3 --timeout=15 \
+            "$url" -O "$output"
+    fi
 }
-command -v unzip >/dev/null 2>&1 || {
-  echo "unzip is required." >&2
-  exit 1
-}
+
+# ---------- Check operating environment ----------
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "ERROR: systemd/systemctl is required." >&2
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 is required to validate the JSON config." >&2
+    echo "Debian/Ubuntu: apt-get install -y python3" >&2
+    exit 1
+fi
 
 mkdir -p "$BASE"
 chmod 700 "$BASE"
 
-# ---------- Install Xray if missing ----------
-
-if [ ! -x "$BASE/xray" ]; then
-  TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "${TMP_DIR:-}"' EXIT
-
-  URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"
-
-  curl -fL --retry 3 -o "$TMP_DIR/xray.zip" "$URL"
-  unzip -o -q "$TMP_DIR/xray.zip" xray -d "$BASE"
-  chmod 700 "$BASE/xray"
-
-  rm -rf "$TMP_DIR"
-  trap - EXIT
-fi
-
-# ---------- Install cloudflared if missing ----------
-
-if [ ! -x "$BASE/cloudflared" ]; then
-  URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CPU}"
-  TMP_FILE="$(mktemp)"
-
-  curl -fL --retry 3 -o "$TMP_FILE" "$URL"
-  install -m 700 "$TMP_FILE" "$BASE/cloudflared"
-  rm -f "$TMP_FILE"
-fi
-
-# ---------- Generate multiple Xray inbounds ----------
-
-TMP_CONFIG="$(mktemp "$BASE/xray.json.XXXXXX")"
-trap 'rm -f "${TMP_CONFIG:-}"' EXIT
-
-printf '{"log":{"loglevel":"warning"},"inbounds":[' > "$TMP_CONFIG"
-
-for ((i=0; i<N; i++)); do
-  PORT="${PORT_ARR[$i]}"
-  PATH="${PATH_ARR[$i]}"
-
-  (( i > 0 )) && printf ',' >> "$TMP_CONFIG"
-
-  cat >> "$TMP_CONFIG" <<JSON
-{
-  "listen": "127.0.0.1",
-  "port": ${PORT},
-  "protocol": "vless",
-  "settings": {
-    "clients": [
-      {
-        "id": "${UUID}"
-      }
-    ],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "xhttp",
-    "security": "none",
-    "xhttpSettings": {
-      "path": "/${PATH}",
-      "mode": "packet-up",
-      "xPaddingObfsMode": true,
-      "xPaddingMethod": "tokenish",
-      "xPaddingPlacement": "queryInHeader",
-      "xPaddingHeader": "${PAD_HEADER}",
-      "xPaddingKey": "${PAD_KEY}"
-    }
-  }
+TMP_DIR="$(mktemp -d)"
+cleanup() {
+    rm -rf "$TMP_DIR"
 }
-JSON
+trap cleanup EXIT
+
+# ---------- Download Xray ----------
+echo "[1/7] Downloading Xray-core..."
+
+XRAY_ZIP="${TMP_DIR}/xray.zip"
+download_file \
+    "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip" \
+    "$XRAY_ZIP"
+
+unzip -oq "$XRAY_ZIP" xray -d "$TMP_DIR"
+install -m 755 "${TMP_DIR}/xray" "$XRAY_BIN"
+
+# ---------- Download cloudflared ----------
+echo "[2/7] Downloading cloudflared..."
+
+CF_ARCH="$CPU"
+download_file \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" \
+    "${TMP_DIR}/cloudflared"
+
+install -m 755 "${TMP_DIR}/cloudflared" "$CLOUDFLARED_BIN"
+
+# ---------- Generate Xray config ----------
+echo "[3/7] Generating Xray configuration..."
+
+cat > "$XRAY_CONFIG" <<'JSON_HEAD'
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+JSON_HEAD
+
+for i in "${!PORTS[@]}"; do
+    if (( i > 0 )); then
+        printf ',\n' >> "$XRAY_CONFIG"
+    fi
+
+    cat >> "$XRAY_CONFIG" <<JSON_INBOUND
+    {
+      "listen": "127.0.0.1",
+      "port": ${PORTS[$i]},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}",
+            "email": "domain-${i}"
+          }
+        ],
+        "decryption": "none",
+        "encryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "xhttpSettings": {
+          "path": "${PATHS[$i]}",
+          "mode": "packet-up",
+          "xPaddingBytes": "100-1000",
+          "xPaddingObfsMode": true,
+          "xPaddingHeader": "${PAD_HEADER}",
+          "xPaddingKey": "${PAD_KEY}"
+        }
+      },
+      "sniffing": {
+        "enabled": false
+      }
+    }
+JSON_INBOUND
 done
 
-printf '],"outbounds":[{"protocol":"freedom"}]}' >> "$TMP_CONFIG"
+cat >> "$XRAY_CONFIG" <<'JSON_TAIL'
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ]
+}
+JSON_TAIL
 
-chmod 600 "$TMP_CONFIG"
+chmod 600 "$XRAY_CONFIG"
 
-# Validate configuration before replacing the current one.
-"$BASE/xray" run -test -c "$TMP_CONFIG"
+# ---------- Validate config ----------
+echo "[4/7] Validating Xray configuration..."
 
-mv -f "$TMP_CONFIG" "$BASE/xray.json"
-trap - EXIT
-chmod 600 "$BASE/xray.json"
+python3 -m json.tool "$XRAY_CONFIG" >/dev/null
 
-# ---------- Save Tunnel token ----------
+"$XRAY_BIN" run -test -config "$XRAY_CONFIG"
 
-printf 'TUNNEL_TOKEN=%s\n' "$ARGO_AUTH" > "$BASE/cloudflared.env"
-chmod 600 "$BASE/cloudflared.env"
+# ---------- Configure Cloudflare Token ----------
+echo "[5/7] Configuring Cloudflare Tunnel..."
 
-# ---------- Configure services ----------
+printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" > "$TOKEN_FILE"
+chmod 600 "$TOKEN_FILE"
 
-if command -v systemctl >/dev/null 2>&1 &&
-   [ "$(ps -p 1 -o comm= 2>/dev/null | tr -d ' ')" = "systemd" ]; then
+# A wrapper avoids systemd variable-expansion problems.
+cat > "${BASE}/run-cloudflared.sh" <<'CF_WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/local/bin/cloudflared tunnel \
+    --no-autoupdate \
+    --protocol http2 \
+    run \
+    --token "$TUNNEL_TOKEN"
+CF_WRAPPER
+chmod 700 "${BASE}/run-cloudflared.sh"
 
-  cat > /etc/systemd/system/vless-argo-xray.service <<UNIT
+# ---------- Create systemd services ----------
+echo "[6/7] Creating systemd services..."
+
+cat > "/etc/systemd/system/${XRAY_SERVICE}.service" <<XRAY_UNIT
 [Unit]
-Description=VLESS XHTTP Multi-Inbound Xray
-Wants=network-online.target
+Description=VLESS XHTTP packet-up multi-domain service
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${BASE}/xray run -c ${BASE}/xray.json
-Restart=always
+ExecStart=${XRAY_BIN} run -config ${XRAY_CONFIG}
+Restart=on-failure
 RestartSec=3
-UMask=0077
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+XRAY_UNIT
 
-  cat > /etc/systemd/system/vless-argo.service <<UNIT
+cat > "/etc/systemd/system/${CF_SERVICE}.service" <<CF_UNIT
 [Unit]
 Description=Cloudflare Tunnel for VLESS XHTTP
+After=network-online.target ${XRAY_SERVICE}.service
 Wants=network-online.target
-After=network-online.target vless-argo-xray.service
-Requires=vless-argo-xray.service
 
 [Service]
 Type=simple
-EnvironmentFile=${BASE}/cloudflared.env
-ExecStart=${BASE}/cloudflared tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run
-Restart=always
-RestartSec=3
-UMask=0077
+EnvironmentFile=${TOKEN_FILE}
+ExecStart=${BASE}/run-cloudflared.sh
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-UNIT
+CF_UNIT
 
-  chmod 644 \
-    /etc/systemd/system/vless-argo-xray.service \
-    /etc/systemd/system/vless-argo.service
+systemctl daemon-reload
+systemctl enable "$XRAY_SERVICE" "$CF_SERVICE"
+systemctl restart "$XRAY_SERVICE"
+systemctl restart "$CF_SERVICE"
 
-  systemctl daemon-reload
-  systemctl enable vless-argo-xray.service vless-argo.service
+sleep 2
 
-  systemctl restart vless-argo-xray.service
-  systemctl restart vless-argo.service
-
-  sleep 2
-
-  systemctl --no-pager --full status vless-argo-xray.service || true
-  systemctl --no-pager --full status vless-argo.service || true
-
-else
-  echo "This script's managed-service installation requires systemd." >&2
-  echo "Install on a systemd-based VPS to avoid unmanaged background processes." >&2
-  exit 1
+if ! systemctl is-active --quiet "$XRAY_SERVICE"; then
+    echo "ERROR: Xray service failed to start." >&2
+    systemctl --no-pager --full status "$XRAY_SERVICE" || true
+    journalctl -u "$XRAY_SERVICE" -n 50 --no-pager || true
+    exit 1
 fi
 
-# ---------- Generate client links ----------
+if ! systemctl is-active --quiet "$CF_SERVICE"; then
+    echo "WARNING: cloudflared service is not active yet." >&2
+    systemctl --no-pager --full status "$CF_SERVICE" || true
+    journalctl -u "$CF_SERVICE" -n 50 --no-pager || true
+fi
 
-EXTRA='%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22'"${PAD_HEADER}"'%22%2C%22xPaddingKey%22%3A%22'"${PAD_KEY}"'%22%7D'
-
+# ---------- Output connection links ----------
 echo
-echo "===== VLESS XHTTP client links ====="
-echo "NOTE: Configure each hostname in Cloudflare Zero Trust separately."
-echo "NOTE: Links do not create Cloudflare routes automatically."
+echo "[7/7] Installation finished."
+echo
+echo "Xray service:       systemctl status ${XRAY_SERVICE}"
+echo "Cloudflare service: systemctl status ${CF_SERVICE}"
+echo "Xray config:        ${XRAY_CONFIG}"
+echo
+echo "IMPORTANT: Add each hostname in the Cloudflare Zero Trust Tunnel dashboard:"
+echo "  hostname -> http://127.0.0.1:PORT"
 echo
 
-for ((i=0; i<N; i++)); do
-  DOMAIN="${DOMAIN_ARR[$i]}"
-  PATH="${PATH_ARR[$i]}"
+for i in "${!PORTS[@]}"; do
+    domain="${DOMAINS[$i]}"
+    path="${PATHS[$i]}"
+    encoded_path="${path//\//%2F}"
 
-  printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2&type=xhttp&host=%s&path=/%s&mode=packet-up&extra=%s#vless-xhttp-%d\n' \
-    "$UUID" "$DOMAIN" "$DOMAIN" "$DOMAIN" "$PATH" "$EXTRA" "$((i+1))"
+    printf 'Domain: %s\n' "$domain"
+    printf 'Origin: http://127.0.0.1:%s\n' "${PORTS[$i]}"
+    printf 'Path:   %s\n' "$path"
+    printf 'VLESS:  vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%s&mode=packet-up#%s\n\n' \
+        "$UUID" "$domain" "$domain" "$domain" "$encoded_path" "$domain"
 done
 
-echo
-echo "===== Next steps ====="
-echo "1. Add each hostname to the existing Tunnel in Cloudflare Zero Trust."
-echo "2. Map each hostname to http://localhost:<corresponding-port>."
-echo "3. Test every client profile for upload, download and reconnect."
-echo
-echo "Configuration: $BASE/xray.json"
-echo "Token file:    $BASE/cloudflared.env"
-echo "Xray logs:     journalctl -u vless-argo-xray -f"
-echo "Tunnel logs:   journalctl -u vless-argo -f"
+echo "Check logs with:"
+echo "  journalctl -u ${XRAY_SERVICE} -n 100 --no-pager"
+echo "  journalctl -u ${CF_SERVICE} -n 100 --no-pager"
