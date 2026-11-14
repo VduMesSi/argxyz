@@ -41,8 +41,49 @@ case "$(uname -m)" in
   *) exit 1 ;;
 esac
 
-command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || exit 1
-command -v unzip >/dev/null 2>&1 || exit 1
+# command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || exit 1
+# command -v unzip >/dev/null 2>&1 || exit 1
+
+# Check download tools
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "ERROR: Neither curl nor wget is installed."
+    exit 1
+fi
+
+# Check and install unzip
+if ! command -v unzip >/dev/null 2>&1; then
+    echo "unzip not found. Installing..."
+
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y unzip
+
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y unzip
+
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y unzip
+
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache unzip
+
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install unzip
+
+    else
+        echo "ERROR: Unsupported package manager."
+        echo "Please install unzip manually."
+        exit 1
+    fi
+fi
+
+# Verify installation
+if ! command -v unzip >/dev/null 2>&1; then
+    echo "ERROR: unzip installation failed."
+    exit 1
+fi
+
 mkdir -p "$BASE"
 chmod 700 "$BASE"
 
