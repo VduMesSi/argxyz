@@ -53,28 +53,10 @@ fi
 # Check and install unzip
 if ! command -v unzip >/dev/null 2>&1; then
     echo "unzip not found. Installing..."
-
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
         apt-get install -y unzip
-
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y unzip
-
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y unzip
-
-    elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache unzip
-
-    elif command -v zypper >/dev/null 2>&1; then
-        zypper --non-interactive install unzip
-
-    else
-        echo "ERROR: Unsupported package manager."
-        echo "Please install unzip manually."
-        exit 1
     fi
 fi
 
